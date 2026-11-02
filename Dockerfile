@@ -1,8 +1,8 @@
-FROM python:3.9
-
-WORKDIR /config
-COPY ./ckb-node-probe.py ./requirements.txt /config/
-RUN pip3 install -r requirements.txt
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY ckb-node-probe.py .
 ENV PORT=3000
-
-CMD "python3" "ckb-node-probe.py" "$node_probe_api" 
+EXPOSE 3000
+CMD ["python3", "ckb-node-probe.py"]
