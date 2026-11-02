@@ -5,18 +5,18 @@ CKB Node Probe Prometheus exporter that **separately polls Mainnet and Testnet i
 ## Run
 
 ```bash
-docker build -t ckb-node-probe-exporter:staggered .
+docker build -t ckb-node-probe-exporter:periodic .
 docker run -d --name ckb-node-probe-exporter -p 3000:3000 \
   -e node_probe_api=https://api-nodes.ckb.dev/ \
-  ckb-node-probe-exporter:staggered
+  ckb-node-probe-exporter:periodic
 curl -s http://127.0.0.1:3000/metrics/probe
 ```
 
-Config: `node_probe_api` (default `https://api-nodes.ckb.dev/`), `NODE_PROBE_API_TIMEOUT` (default 10 seconds), `NODE_PROBE_POLL_GAP` (default 35 seconds, must be >30), `PORT` (default 3000).
+Config: `node_probe_api` (default `https://api-nodes.ckb.dev/`), `NODE_PROBE_API_TIMEOUT` (default 10 seconds), `NODE_PROBE_POLL_INTERVAL` (default 60 seconds, must be >0), `PORT` (default 3000).
 
-The poller requests mainnet, waits 35 seconds, requests testnet, waits 35 seconds, then repeats. Health is polled before mainnet. This avoids fetching both networks within the upstream API's 30-second shared in-memory cache window *when the exporter is the only client refreshing that cache*. Other clients, replicas, or proxies may still populate the upstream cache; the actual fix is network-specific caching in `ckb-discovery/exposed`.
+The poller requests mainnet and testnet sequentially without a forced gap, once every 60 seconds (measured from the start of each cycle). Health is polled before the network requests. This assumes the upstream API has already fixed network-specific cache isolation.
 
-**Startup:** metrics are immediately available, but network counts start at `-1` and success at `0` until each first successful poll (testnet is first polled after about 35 seconds). After an API failure, last known counts are retained; use success and last-success time to detect stale data.
+**Startup:** metrics are immediately available, but network counts start at `-1` and success at `0` until each first successful poll (testnet is polled immediately after mainnet). After an API failure, last known counts are retained; use success and last-success time to detect stale data.
 
 ## Metrics
 
@@ -27,6 +27,6 @@ The poller requests mainnet, waits 35 seconds, requests testnet, waits 35 second
 - `ckb_node_probe_last_success_timestamp_seconds{network="main|test"}`: Unix timestamp of last successful poll; 0 before the first success.
 - `get_api_last_update{node_probe_health_api="..."}`: last update from `/health`, or -1 on health failure.
 
-Run exactly **one exporter process/replica** for this workaround; multiple instances can refresh the upstream cache at different times and collide. Do not use Flask's reloader or multi-worker web servers with this in-process poller. Protect alerts from stale results, e.g. by combining count checks with `ckb_node_probe_scrape_success == 1` and a maximum `time() - ckb_node_probe_last_success_timestamp_seconds`.
+Use a single exporter process per container so that only one background polling thread is started. Do not use Flask's reloader or multi-worker web servers with this in-process poller. Protect alerts from stale results, e.g. by combining count checks with `ckb_node_probe_scrape_success == 1` and a maximum `time() - ckb_node_probe_last_success_timestamp_seconds`.
 
-**Upstream caveat:** This is a best-effort operational workaround, not a guarantee: the API's 30-second cache is global to its instance, and another consumer can refresh it between our staggered requests. Fix the cache key in `ckb-discovery/exposed` for definitive network separation.
+**Upstream prerequisite:** Deploy the network-specific cache fix in `ckb-discovery/exposed` before switching to this version. Without it, back-to-back queries may still return cross-network cached data.
