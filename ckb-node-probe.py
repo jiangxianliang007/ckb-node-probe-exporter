@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Prometheus exporter with staggered polling to reduce cross-network cache contamination."""
+"""Prometheus exporter with periodic mainnet and testnet polling."""
 
 import logging
 import os
@@ -15,11 +15,10 @@ from prometheus_client import CollectorRegistry, Gauge, generate_latest
 DEFAULT_API = "https://api-nodes.ckb.dev/"
 API_BASE = os.environ.get("node_probe_api") or (sys.argv[1] if len(sys.argv) > 1 else DEFAULT_API)
 API_TIMEOUT = float(os.environ.get("NODE_PROBE_API_TIMEOUT", "10"))
-# The upstream /peer process cache lasts 30 seconds. Keep a safety margin.
-POLL_GAP = float(os.environ.get("NODE_PROBE_POLL_GAP", "35"))
+POLL_INTERVAL = float(os.environ.get("NODE_PROBE_POLL_INTERVAL", "60"))
 PORT = int(os.environ.get("PORT", "3000"))
-if POLL_GAP <= 30:
-    raise ValueError("NODE_PROBE_POLL_GAP must be greater than 30 seconds")
+if POLL_INTERVAL <= 0:
+    raise ValueError("NODE_PROBE_POLL_INTERVAL must be greater than zero")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,13 +86,13 @@ def poll_health():
 
 def polling_loop():
     # There is no API request in the Prometheus scrape handler.
-    # Alternating requests keep >=35s between network requests in this worker.
+    # Fetch both networks sequentially once per interval, without a forced gap.
     while True:
+        started = time.monotonic()
         poll_health()
         poll_network("main")
-        time.sleep(POLL_GAP)
         poll_network("test")
-        time.sleep(POLL_GAP)
+        time.sleep(max(0, POLL_INTERVAL - (time.monotonic() - started)))
 
 
 @app.route("/metrics/probe")
