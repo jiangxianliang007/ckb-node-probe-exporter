@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Prometheus exporter for CKB Node Probe mainnet and testnet."""
+"""Prometheus exporter with staggered polling to reduce cross-network cache contamination."""
 
+import logging
 import os
 import sys
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import threading
+import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from flask import Flask, Response
@@ -12,31 +15,85 @@ from prometheus_client import CollectorRegistry, Gauge, generate_latest
 DEFAULT_API = "https://api-nodes.ckb.dev/"
 API_BASE = os.environ.get("node_probe_api") or (sys.argv[1] if len(sys.argv) > 1 else DEFAULT_API)
 API_TIMEOUT = float(os.environ.get("NODE_PROBE_API_TIMEOUT", "10"))
+# The upstream /peer process cache lasts 30 seconds. Keep a safety margin.
+POLL_GAP = float(os.environ.get("NODE_PROBE_POLL_GAP", "35"))
 PORT = int(os.environ.get("PORT", "3000"))
+if POLL_GAP <= 30:
+    raise ValueError("NODE_PROBE_POLL_GAP must be greater than 30 seconds")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 app = Flask(__name__)
+_lock = threading.Lock()
+_samples = {
+    "main": {"total": -1, "known": -1, "unknown": -1, "success": 0, "last_success": 0},
+    "test": {"total": -1, "known": -1, "unknown": -1, "success": 0, "last_success": 0},
+}
+_health_last_update = -1
 
 
 def api_url(path, network=None):
-    """Build a URL without inheriting an accidentally pinned network parameter."""
-    base = API_BASE.rstrip("/")
-    parts = urlsplit(base)
+    parts = urlsplit(API_BASE.rstrip("/"))
     root_path = parts.path.rstrip("/")
     if root_path.endswith("/peer"):
         root_path = root_path[:-5]
-    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
-             if key != "network"]
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k != "network"]
     if network:
         query.append(("network", network))
-    # Preserve existing timeout parameters when configured by the caller.
     return urlunsplit((parts.scheme, parts.netloc, root_path + "/" + path,
                        urlencode(query), parts.fragment))
 
 
 def fetch_json(url):
-    response = requests.get(url, timeout=API_TIMEOUT)
+    response = requests.get(
+        url, timeout=API_TIMEOUT,
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
     response.raise_for_status()
     return response.json()
+
+
+def poll_network(network):
+    url = api_url("peer", network)
+    try:
+        peers = fetch_json(url)
+        if not isinstance(peers, list) or not all(isinstance(p, dict) for p in peers):
+            raise ValueError("Expected a JSON array of peer objects")
+        known = sum(bool(p.get("version")) for p in peers)
+        with _lock:
+            _samples[network] = {
+                "total": len(peers), "known": known, "unknown": len(peers) - known,
+                "success": 1, "last_success": time.time(),
+            }
+        logger.info("Collected %s: total=%d known=%d", network, len(peers), known)
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        # Preserve last known counts, but report the failed API request.
+        with _lock:
+            _samples[network]["success"] = 0
+        logger.warning("Failed to collect %s: %s", network, exc)
+
+
+def poll_health():
+    global _health_last_update
+    try:
+        value = float(fetch_json(api_url("health"))["last_update"])
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        logger.warning("Failed to collect health endpoint: %s", exc)
+        value = -1
+    with _lock:
+        _health_last_update = value
+
+
+def polling_loop():
+    # There is no API request in the Prometheus scrape handler.
+    # Alternating requests keep >=35s between network requests in this worker.
+    while True:
+        poll_health()
+        poll_network("main")
+        time.sleep(POLL_GAP)
+        poll_network("test")
+        time.sleep(POLL_GAP)
 
 
 @app.route("/metrics/probe")
@@ -48,37 +105,29 @@ def metrics():
                   ["network"], registry=registry)
     unknown = Gauge("ckb_node_probe_version_unknown", "Nodes with an empty version",
                     ["network"], registry=registry)
-    success = Gauge("ckb_node_probe_scrape_success", "Whether the network API request succeeded",
+    success = Gauge("ckb_node_probe_scrape_success", "Whether the latest API poll succeeded",
                     ["network"], registry=registry)
+    last_success = Gauge("ckb_node_probe_last_success_timestamp_seconds",
+                         "Unix time of most recent successful network API poll",
+                         ["network"], registry=registry)
     last_update = Gauge("get_api_last_update", "Timestamp of last CKB Node Probe update",
                         ["node_probe_health_api"], registry=registry)
 
-    health_url = api_url("health")
-    try:
-        health = fetch_json(health_url)
-        last_update.labels(node_probe_health_api=health_url).set(float(health["last_update"]))
-    except (requests.RequestException, ValueError, TypeError, KeyError):
-        last_update.labels(node_probe_health_api=health_url).set(-1)
+    with _lock:
+        snapshot = {network: record.copy() for network, record in _samples.items()}
+        health_last_update = _health_last_update
 
-    for network in ("main", "test"):
-        peer_url = api_url("peer", network)
-        try:
-            peers = fetch_json(peer_url)
-            if not isinstance(peers, list):
-                raise ValueError("Expected a JSON array from /peer")
-            count_known = sum(1 for node in peers if isinstance(node, dict) and node.get("version"))
-            total.labels(network=network, node_probe_api=peer_url).set(len(peers))
-            known.labels(network=network).set(count_known)
-            unknown.labels(network=network).set(len(peers) - count_known)
-            success.labels(network=network).set(1)
-        except (requests.RequestException, ValueError, TypeError):
-            total.labels(network=network, node_probe_api=peer_url).set(-1)
-            known.labels(network=network).set(-1)
-            unknown.labels(network=network).set(-1)
-            success.labels(network=network).set(0)
-
+    for network, record in snapshot.items():
+        total.labels(network=network, node_probe_api=api_url("peer", network)).set(record["total"])
+        known.labels(network=network).set(record["known"])
+        unknown.labels(network=network).set(record["unknown"])
+        success.labels(network=network).set(record["success"])
+        last_success.labels(network=network).set(record["last_success"])
+    last_update.labels(node_probe_health_api=api_url("health")).set(health_last_update)
     return Response(generate_latest(registry), mimetype="text/plain; version=0.0.4")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    # One polling worker per process; do not enable the Flask reloader.
+    threading.Thread(target=polling_loop, name="ckb-node-probe-poller", daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
